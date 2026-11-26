@@ -702,8 +702,68 @@ describe('RequestFulfillmentService.grab from a picked release', () => {
     // No client is resolved at all: there is no row for the built-in downloader to be found in.
     expect(clients.findPreferredEnabled).not.toHaveBeenCalled();
     expect(downloads.create).toHaveBeenCalledWith(expect.objectContaining({ downloadClientId: null, source: 'direct_url' }));
-    expect(direct.add).toHaveBeenCalledWith(expect.objectContaining({ fileUrl: directRelease.downloadUrl, fileName: '2868.epub' }));
+    expect(direct.add).toHaveBeenCalledWith(
+      expect.objectContaining({ fileUrl: directRelease.downloadUrl, fileName: '2868.epub', allowPrivate: false }),
+    );
     expect(adapter.add).not.toHaveBeenCalled();
+  });
+
+  it('passes a source allow-private opt-in through to the direct download', async () => {
+    const directRelease = { ...RELEASE, downloadUrl: 'http://192.168.1.10:8789/book.epub', format: 'epub' };
+    const { service, direct } = makeService({
+      indexers: {
+        resolveConfig: vi.fn().mockResolvedValue({
+          id: 9,
+          name: 'Local relay',
+          adapterType: 'project-gutenberg',
+          allowPrivateAddress: true,
+          seedRatioGoal: null,
+        }),
+      },
+      releases: { find: vi.fn().mockReturnValue(directRelease) },
+      indexerAdapter: {
+        resolveFile: vi.fn().mockResolvedValue({
+          url: directRelease.downloadUrl,
+          fileName: 'book.epub',
+          sizeBytes: 1234,
+          format: 'epub',
+        }),
+      },
+    });
+
+    await service.grab(7, { indexerId: 9, releaseGuid: 'r-1' }, user());
+
+    expect(direct.add).toHaveBeenCalledWith(expect.objectContaining({ fileUrl: directRelease.downloadUrl, allowPrivate: true }));
+  });
+
+  it('does not opt a direct download into private addresses when the source is gone', async () => {
+    const directRelease = { ...RELEASE, downloadUrl: 'https://www.gutenberg.org/ebooks/2868.epub', format: 'epub' };
+    const resolveConfig = vi
+      .fn()
+      .mockResolvedValueOnce({
+        id: 9,
+        name: 'Project Gutenberg',
+        adapterType: 'project-gutenberg',
+        allowPrivateAddress: true,
+        seedRatioGoal: null,
+      })
+      .mockRejectedValueOnce(new NotFoundException('Indexer not found'));
+    const { service, direct } = makeService({
+      indexers: { resolveConfig },
+      releases: { find: vi.fn().mockReturnValue(directRelease) },
+      indexerAdapter: {
+        resolveFile: vi.fn().mockResolvedValue({
+          url: directRelease.downloadUrl,
+          fileName: '2868.epub',
+          sizeBytes: 1234,
+          format: 'epub',
+        }),
+      },
+    });
+
+    await service.grab(7, { indexerId: 9, releaseGuid: 'r-1' }, user());
+
+    expect(direct.add).toHaveBeenCalledWith(expect.objectContaining({ allowPrivate: false }));
   });
 
   /**

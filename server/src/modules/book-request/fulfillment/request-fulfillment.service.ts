@@ -298,6 +298,7 @@ export class RequestFulfillmentService {
           fileUrl: directUrl as string,
           fileName: directFileName as string,
           clientKey: grab.clientKey,
+          allowPrivate: await this.directSourceAllowsPrivate(grab.indexerId),
         });
       } else {
         const config = await this.clients.resolveConfig(client.id);
@@ -351,6 +352,21 @@ export class RequestFulfillmentService {
     this.gateway.emitChanged();
 
     return this.toItem(requestId, user?.id ?? null);
+  }
+
+  /**
+   * The direct fetcher refuses private addresses unless this grab's source opted in. A source that
+   * has disappeared since the search is not an opt-in.
+   */
+  private async directSourceAllowsPrivate(indexerId: number | undefined): Promise<boolean> {
+    if (indexerId === undefined) return false;
+    try {
+      const indexer = await this.indexers.resolveConfig(indexerId);
+      return indexer.allowPrivateAddress === true;
+    } catch (error) {
+      if (error instanceof NotFoundException || error instanceof BadRequestException) return false;
+      throw error;
+    }
   }
 
   private async withTransientRetry<T>(automated: boolean, requestId: number, phase: 'source' | 'client', run: () => Promise<T>): Promise<T> {

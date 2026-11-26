@@ -1,5 +1,5 @@
 import { createWriteStream } from 'node:fs';
-import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 
 import { Readable } from 'node:stream';
@@ -93,10 +93,26 @@ const USER_AGENT = 'BookOrbit';
 
 /**
  * A release URL comes from an indexer, which is the one thing on this path that is never trusted,
- * so a direct fetch never reaches the private network. Torrent clients get a per-row opt-in
- * because they live on the LAN; there is no equivalent reason for a file to.
+ * so a direct fetch stays off the private network unless the source that produced the grab opted
+ * in with allowPrivateAddress. That choice is written next to the partial file: a restart resumes
+ * from the attempt row and the staging directory, and the row does not store the flag.
  */
 const ALLOW_PRIVATE = false;
+const PRIVATE_MARKER = '.allow-private';
+
+async function readPrivateMarker(directory: string): Promise<boolean> {
+  try {
+    await readFile(join(directory, PRIVATE_MARKER));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function writePrivateMarker(directory: string, allowPrivate: boolean): Promise<void> {
+  if (!allowPrivate) return;
+  await writeFile(join(directory, PRIVATE_MARKER), '1');
+}
 
 interface Progress {
   state: DownloadStatus['state'];
@@ -119,6 +135,11 @@ export interface DirectDownloadRequest {
    * derives a stable digest of the URL, which keeps the duplicate-grab index meaningful.
    */
   clientKey: string;
+  /**
+   * Set when the source that produced this grab has allowPrivateAddress enabled.
+   * Absent keeps the default and refuses a private or local address.
+   */
+  allowPrivate?: boolean;
 }
 
 /**
@@ -158,13 +179,15 @@ export class DirectDownloadService {
   }
 
   async add(release: DirectDownloadRequest): Promise<{ clientKey: string }> {
-    const url = await ensureSafeUrl(release.fileUrl, { allowPrivate: ALLOW_PRIVATE });
+    const allowPrivate = release.allowPrivate === true || ALLOW_PRIVATE;
+    const url = await ensureSafeUrl(release.fileUrl, { allowPrivate });
 
     const directory = join(this.root, release.clientKey);
     const target = safeJoin(directory, stagedDirectFileName(release.fileName, release.format));
 
     await mkdir(directory, { recursive: true });
-    this.start(release.downloadId, release.clientKey, url, target, directory, 0, null, null);
+    await writePrivateMarker(directory, allowPrivate);
+    this.start(release.downloadId, release.clientKey, url, target, directory, 0, null, null, allowPrivate);
 
     return { clientKey: release.clientKey };
   }
@@ -181,8 +204,9 @@ export class DirectDownloadService {
       return false;
     }
 
-    const url = await ensureSafeUrl(download.directUrl, { allowPrivate: ALLOW_PRIVATE });
     const directory = join(this.root, download.clientKey);
+    const allowPrivate = (await readPrivateMarker(directory)) || ALLOW_PRIVATE;
+    const url = await ensureSafeUrl(download.directUrl, { allowPrivate });
     const target = safeJoin(directory, download.directFileName);
     const existingBytes = await stat(target)
       .then((entry) => (entry.isFile() ? entry.size : 0))
@@ -192,9 +216,10 @@ export class DirectDownloadService {
     if (existingBytes > MAX_FILE_BYTES) return false;
 
     await mkdir(directory, { recursive: true });
-    this.start(download.id, download.clientKey, url, target, directory, existingBytes, validator, download.totalBytes);
+    await writePrivateMarker(directory, allowPrivate);
+    this.start(download.id, download.clientKey, url, target, directory, existingBytes, validator, download.totalBytes, allowPrivate);
     this.logger.log(
-      `[direct_download.resume] [start] downloadId=${download.id} key=${download.clientKey} bytes=${existingBytes} - resuming an interrupted direct download`,
+      `[direct_download.resume] [start] downloadId=${download.id} key=${download.clientKey} bytes=${existingBytes} allowPrivate=${allowPrivate} - resuming an interrupted direct download`,
     );
     return true;
   }
@@ -208,6 +233,7 @@ export class DirectDownloadService {
     offset: number,
     validator: string | null,
     expectedBytes: number | null,
+    allowPrivate: boolean,
   ): void {
     this.progress.set(clientKey, {
       state: 'downloading',
@@ -220,7 +246,7 @@ export class DirectDownloadService {
 
     // Deliberately not awaited: `add` hands the work over the way a torrent client does, and the
     // poll loop is what reports on it from here.
-    const task = this.run(downloadId, clientKey, url, target, controller.signal, offset, validator, expectedBytes)
+    const task = this.run(downloadId, clientKey, url, target, controller.signal, offset, validator, expectedBytes, allowPrivate)
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
         const message = error instanceof Error ? error.message : String(error);
@@ -349,8 +375,9 @@ export class DirectDownloadService {
     offset: number,
     validator: string | null,
     expectedBytes: number | null,
+    allowPrivate: boolean,
   ): Promise<void> {
-    const response = await this.open(url, signal, offset > 0 ? { Range: `bytes=${offset}-`, 'If-Range': validator as string } : {});
+    const response = await this.open(url, signal, offset > 0 ? { Range: `bytes=${offset}-`, 'If-Range': validator as string } : {}, allowPrivate);
     const responseMeta = validateDownloadResponse(response, offset, expectedBytes, validator);
     const totalBytes = responseMeta.totalBytes;
     if (totalBytes !== null && totalBytes > MAX_FILE_BYTES) {
@@ -473,16 +500,16 @@ export class DirectDownloadService {
    * socket open until the agent times it out: five hops through a chain of mirrors would otherwise
    * leave five sockets and five buffers behind per grab.
    */
-  private async open(url: URL, signal: AbortSignal, headers: Record<string, string> = {}): Promise<Response> {
+  private async open(url: URL, signal: AbortSignal, headers: Record<string, string>, allowPrivate: boolean): Promise<Response> {
     let current = url;
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-      const response = await this.openHop(current, signal, headers);
+      const response = await this.openHop(current, signal, headers, allowPrivate);
 
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
         await response.body?.cancel().catch(() => {});
         if (!location) throw new Error(`That URL answered ${response.status} without saying where to go`);
-        current = await ensureSafeUrl(new URL(location, current).href, { allowPrivate: ALLOW_PRIVATE });
+        current = await ensureSafeUrl(new URL(location, current).href, { allowPrivate });
 
         continue;
       }
@@ -508,7 +535,7 @@ export class DirectDownloadService {
    *
    * The body is not left unbounded: `run` holds it to an idle timeout and a total ceiling.
    */
-  private async openHop(url: URL, signal: AbortSignal, headers: Record<string, string>): Promise<Response> {
+  private async openHop(url: URL, signal: AbortSignal, headers: Record<string, string>, allowPrivate: boolean): Promise<Response> {
     const connect = new AbortController();
     const deadline = setTimeout(() => connect.abort(new Error(`That URL did not answer within ${CONNECT_TIMEOUT_MS}ms`)), CONNECT_TIMEOUT_MS);
     try {
@@ -522,7 +549,7 @@ export class DirectDownloadService {
         // Pinned, because the URL came from an indexer or a plugin rather than from an operator:
         // this is exactly the caller the resolve-twice window in `safeFetch` is not acceptable
         // for, so the address that passed policy is the address the socket opens to.
-        { allowPrivate: ALLOW_PRIVATE, profile: null, pinResolvedAddress: true },
+        { allowPrivate, profile: null, pinResolvedAddress: true },
       );
     } finally {
       clearTimeout(deadline);

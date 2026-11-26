@@ -438,6 +438,78 @@ describe('DirectDownloadService', () => {
     expect((await settle()).state).toBe('failed');
   });
 
+  /** The default stays closed: a LAN file URL is refused before any byte is fetched. */
+  it('refuses a private address unless the source opted in', async () => {
+    const fileUrl = 'http://192.168.1.10:8789/book.epub';
+
+    await expect(service.add({ fileUrl, fileName: 'book.epub', clientKey: HASH })).rejects.toThrow(/private or local address/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('fetches a private address when the source opted in, and remembers that for a restart', async () => {
+    const fileUrl = 'http://192.168.1.10:8789/book.epub';
+    fetchMock.mockResolvedValue(fileResponse('a real epub would go here'));
+
+    await service.add({ fileUrl, fileName: 'book.epub', clientKey: HASH, allowPrivate: true });
+
+    expect((await settle()).state).toBe('completed');
+    await expect(stat(join(appDataPath, 'request-downloads', HASH, '.allow-private'))).resolves.toBeDefined();
+    expect(fetchMock.mock.calls[0][0]).toBe(fileUrl);
+  });
+
+  it('follows a redirect onto a private address only when the source opted in', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 302, headers: { location: 'http://192.168.1.10:8789/book.epub' } }))
+      .mockResolvedValueOnce(fileResponse('a real epub would go here'));
+
+    await service.add({
+      fileUrl: 'https://archive.org/download/x/book.epub',
+      fileName: 'book.epub',
+      clientKey: HASH,
+      allowPrivate: true,
+    });
+
+    expect((await settle()).state).toBe('completed');
+    expect(fetchMock.mock.calls[1][0]).toBe('http://192.168.1.10:8789/book.epub');
+  });
+
+  it('resumes a private-address download only when the staging directory kept the opt-in', async () => {
+    const directory = join(appDataPath, 'request-downloads', HASH);
+    const fileUrl = 'http://192.168.1.10:8789/book.epub';
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, 'book.epub'), 'partial');
+    const row = {
+      id: 49,
+      source: 'direct_url',
+      clientKey: HASH,
+      directUrl: fileUrl,
+      directFileName: 'book.epub',
+      directEtag: '"edition-1"',
+      directLastModified: null,
+      totalBytes: 12,
+      status: 'downloading',
+    } as BookRequestDownloadRow;
+
+    await expect(service.resume(row)).rejects.toThrow(/private or local address/);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await writeFile(join(directory, '.allow-private'), '1');
+    fetchMock.mockResolvedValue(
+      new Response(' tail', {
+        status: 206,
+        headers: {
+          'content-type': 'application/epub+zip',
+          'content-range': 'bytes 7-11/12',
+          etag: '"edition-1"',
+        },
+      }),
+    );
+
+    await expect(service.resume(row)).resolves.toBe(true);
+    expect((await settle()).state).toBe('completed');
+    await expect(readFile(join(directory, 'book.epub'), 'utf8')).resolves.toBe('partial tail');
+  });
+
   it('gives up rather than following redirects forever', async () => {
     fetchMock.mockResolvedValue(new Response('', { status: 302, headers: { location: 'https://archive.org/again' } }));
 
