@@ -122,14 +122,26 @@ export class ProwlarrClient {
   }
 }
 
+/** Newznab Books/Comics. Comic requests are ebooks now, but indexers still file them here. */
+const COMIC_CATEGORY = 7030;
+
 function categoryMap(value: unknown, fallback: IndexerCategoryMap): IndexerCategoryMap {
   if (!isRecord(value) || !Array.isArray(value.categories)) return fallback;
   const ids = new Set<number>();
   collectCategoryIds(value.categories, ids);
   return {
-    ebook: preferredCategory(ids, 7020, 7000),
+    ebook: withComicCategory(preferredCategory(ids, 7020, 7000), ids),
     audiobook: preferredCategory(ids, 3030, 3000),
   };
+}
+
+/**
+ * 7020 (Books/EBook) still wins over the parent 7000. 7030 is added beside that choice whenever
+ * the caps advertise it, including when it is the only book category the indexer has.
+ */
+function withComicCategory(categories: number[], ids: ReadonlySet<number>): number[] {
+  if (!ids.has(COMIC_CATEGORY) || categories.includes(COMIC_CATEGORY)) return categories;
+  return [...categories, COMIC_CATEGORY];
 }
 
 function collectCategoryIds(values: unknown[], ids: Set<number>): void {

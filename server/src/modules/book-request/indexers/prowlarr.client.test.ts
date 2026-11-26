@@ -97,6 +97,42 @@ describe('ProwlarrClient', () => {
     ]);
   });
 
+  it('includes Books/Comics in ebook searches when the source advertises 7030', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify([
+          {
+            id: 4,
+            name: 'Ebook and comics',
+            protocol: 'torrent',
+            enable: true,
+            capabilities: { categories: [{ id: 7000, subCategories: [{ id: 7020 }, { id: 7030 }] }, { id: 3030 }] },
+          },
+          {
+            id: 5,
+            name: 'Comics only',
+            protocol: 'usenet',
+            enable: true,
+            capabilities: { categories: [{ id: 7030 }] },
+          },
+          {
+            id: 6,
+            name: 'Parent books and comics',
+            protocol: 'torrent',
+            enable: true,
+            capabilities: { categories: [{ id: 7000, subCategories: [{ id: 7030 }] }] },
+          },
+        ]),
+      ),
+    );
+
+    await expect(new ProwlarrClient().indexers(connection)).resolves.toEqual([
+      expect.objectContaining({ id: 4, categories: { ebook: [7020, 7030], audiobook: [3030] } }),
+      expect.objectContaining({ id: 5, categories: { ebook: [7030], audiobook: [] } }),
+      expect.objectContaining({ id: 6, categories: { ebook: [7000, 7030], audiobook: [] } }),
+    ]);
+  });
+
   it('uses exact Prowlarr book categories when the source advertises them', async () => {
     fetchMock.mockResolvedValueOnce(
       new Response(
